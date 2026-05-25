@@ -1,0 +1,429 @@
+""" Historia #8 — Plataforma LMS Concurrente
+
+Parte 1: Sistema Productor-Consumidor (cola de tareas + workers)
+Parte 2: ReadWriteLock con prioridad a escritores
+Parte 3: Barrier para inicio sincronizado de examen """
+
+import threading
+import queue
+import random
+import time
+import statistics
+from dataclasses import dataclass, field
+from typing import Optional
+from datetime import datetime
+ 
+#domain
+@dataclass
+class Assignment:
+    """Tarea enviada por un estudiante."""
+    student_id: str
+    course_id: str
+    assignment_id: str
+    answer_text: str
+    submitted_at: float = field(default_factory=time.time)
+ 
+ 
+@dataclass
+class Grade:
+    """Nota almacenada tras la corrección."""
+    student_id: str
+    assignment_id: str
+    score: float          # 0 – 100
+    graded_by: str        # worker que la corrigió
+    graded_at: float = field(default_factory=time.time)
+ 
+#productor-consumidor
+class GradeRepository:
+    """Repositorio de notas thread-safe."""
+    def __init__(self):
+        self._grades: dict[str, Grade] = {}
+        self._lock = threading.Lock()
+ 
+    def save(self, grade: Grade) -> None:
+        with self._lock:
+            key = f"{grade.student_id}:{grade.assignment_id}"
+            self._grades[key] = grade
+ 
+    def get(self, student_id: str, assignment_id: str) -> Optional[Grade]:
+        with self._lock:
+            return self._grades.get(f"{student_id}:{assignment_id}")
+ 
+    def all_grades(self) -> list[Grade]:
+        with self._lock:
+            return list(self._grades.values())
+ 
+    def count(self) -> int:
+        with self._lock:
+            return len(self._grades)
+ 
+ 
+class AssignmentWorker(threading.Thread):
+    """Worker que toma tareas de la cola y las corrige."""
+    def __init__(self, worker_id: str, task_queue: queue.Queue,
+                 repository: GradeRepository, log: list):
+        super().__init__(name=f"Worker-{worker_id}", daemon=True)
+        self.worker_id = worker_id
+        self.task_queue = task_queue
+        self.repository = repository
+        self.log = log
+        self._tasks_processed = 0
+ 
+    def run(self):
+        while True:
+            assignment: Optional[Assignment] = self.task_queue.get()
+            if assignment is None:          # poison pill → terminar
+                self.task_queue.task_done()
+                break
+ 
+            # Simula tiempo de corrección (I/O-bound o CPU-bound lento)
+            correction_time = random.uniform(0.5, 2.0)
+            time.sleep(correction_time)
+ 
+            score = round(random.uniform(0, 100), 2)
+            grade = Grade(
+                student_id=assignment.student_id,
+                assignment_id=assignment.assignment_id,
+                score=score,
+                graded_by=self.worker_id,
+            )
+            self.repository.save(grade)
+            self._tasks_processed += 1
+ 
+            msg = (f"  [{self.name}] ✓ Corregida tarea de {assignment.student_id} "
+                   f"| assignment={assignment.assignment_id} "
+                   f"| nota={score:.1f} | tiempo={correction_time:.2f}s")
+            self.log.append(msg)
+            print(msg)
+            self.task_queue.task_done()
+ 
+    @property
+    def tasks_processed(self) -> int:
+        return self._tasks_processed
+ 
+ 
+def run_parte1():
+    """
+    Parte 1 — Sistema Productor-Consumidor LMS
+    • Cola con capacidad máxima = 10
+    • 3 workers consumers
+    • 15 estudiantes productores (bloqueantes si cola llena)
+    """
+    QUEUE_CAPACITY = 10
+    N_WORKERS = 3
+    N_STUDENTS = 15
+    COURSES = ["MAT101", "FIS202", "PRG303"]
+ 
+    print("\n" + "═" * 60)
+    print("  PARTE 1 — SISTEMA PRODUCTOR-CONSUMIDOR")
+    print("═" * 60)
+ 
+    task_queue: queue.Queue = queue.Queue(maxsize=QUEUE_CAPACITY)
+    repository = GradeRepository()
+    log = []
+ 
+    #crear e iniciar workers
+    workers = [
+        AssignmentWorker(f"W{i+1}", task_queue, repository, log)
+        for i in range(N_WORKERS)
+    ]
+    for w in workers:
+        w.start()
+ 
+    start = time.time()
+ 
+    #productores: 15 estudiantes en hilos separados ──
+    def student_producer(student_num: int):
+        student_id = f"STU{student_num:03d}"
+        course_id = random.choice(COURSES)
+        assignment_id = f"ASG{random.randint(1, 5):02d}"
+        answer_text = f"Respuesta del estudiante {student_num}"
+ 
+        task = Assignment(student_id, course_id, assignment_id, answer_text)
+        print(f"  [Productor] {student_id} entrega tarea "
+              f"({assignment_id}) — cola: {task_queue.qsize()}/{QUEUE_CAPACITY}")
+        task_queue.put(task)   # bloquea si cola llena
+ 
+    producer_threads = [
+        threading.Thread(target=student_producer, args=(i+1,), name=f"Student-{i+1}")
+        for i in range(N_STUDENTS)
+    ]
+ 
+    #lanzar productores con llegada escalonada ligera
+    for t in producer_threads:
+        t.start()
+        time.sleep(random.uniform(0.0, 0.3))
+ 
+    for t in producer_threads:
+        t.join()
+ 
+    #enviar poison pills para terminar workers
+    for _ in workers:
+        task_queue.put(None)
+ 
+    task_queue.join()   #esperar que todas las tareas sean procesadas
+ 
+    elapsed = time.time() - start
+ 
+    print(f"\n  ── Resumen Parte 1 ──────────────────────────")
+    print(f"  Estudiantes:        {N_STUDENTS}")
+    print(f"  Notas almacenadas:  {repository.count()}")
+    print(f"  Tiempo total:       {elapsed:.2f}s")
+    for w in workers:
+        print(f"  {w.name}: {w.tasks_processed} tareas corregidas")
+ 
+    return repository
+ 
+ 
+#readWriteLock con prioridad a escritores
+class ReadWriteLock:
+    """Lock de lectura-escritura con PRIORIDAD A ESCRITORES."""
+    def __init__(self):
+        self._condition = threading.Condition(threading.Lock())
+        self._readers_active = 0
+        self._pending_writers = 0
+        self._writer_active = False
+ 
+    def acquire_read(self):
+        with self._condition:
+            # Espera si hay escritores activos o en espera (prioridad escritores)
+            while self._writer_active or self._pending_writers > 0:
+                self._condition.wait()
+            self._readers_active += 1
+ 
+    def release_read(self):
+        with self._condition:
+            self._readers_active -= 1
+            if self._readers_active == 0:
+                self._condition.notify_all()  # avisar a escritores esperando
+ 
+    def acquire_write(self):
+        with self._condition:
+            self._pending_writers += 1
+            # Espera a que no haya lectores ni escritores activos
+            while self._readers_active > 0 or self._writer_active:
+                self._condition.wait()
+            self._pending_writers -= 1
+            self._writer_active = True
+ 
+    def release_write(self):
+        with self._condition:
+            self._writer_active = False
+            self._condition.notify_all()
+ 
+ 
+class GradeRepositoryRW:
+    """GradeRepository mejorado con ReadWriteLock."""
+    def __init__(self, initial_grades: dict | None = None):
+        self._grades: dict[str, float] = initial_grades or {
+            f"STU{i:03d}:ASG01": round(random.uniform(50, 100), 1)
+            for i in range(1, 16)
+        }
+        self._rw_lock = ReadWriteLock()
+        self.stats = {
+            "reads": 0,
+            "writes": 0,
+            "read_wait_times": [],
+            "write_wait_times": [],
+        }
+        self._stats_lock = threading.Lock()
+ 
+    def read_grade(self, student_id: str, assignment_id: str) -> Optional[float]:
+        t0 = time.perf_counter()
+        self._rw_lock.acquire_read()
+        wait = time.perf_counter() - t0
+        try:
+            key = f"{student_id}:{assignment_id}"
+            time.sleep(random.uniform(0.05, 0.15))   # simula I/O lectura
+            return self._grades.get(key)
+        finally:
+            self._rw_lock.release_read()
+            with self._stats_lock:
+                self.stats["reads"] += 1
+                self.stats["read_wait_times"].append(wait)
+ 
+    def update_grade(self, student_id: str, assignment_id: str, score: float) -> None:
+        t0 = time.perf_counter()
+        self._rw_lock.acquire_write()
+        wait = time.perf_counter() - t0
+        try:
+            key = f"{student_id}:{assignment_id}"
+            time.sleep(random.uniform(0.1, 0.3))     # simula I/O escritura
+            self._grades[key] = score
+        finally:
+            self._rw_lock.release_write()
+            with self._stats_lock:
+                self.stats["writes"] += 1
+                self.stats["write_wait_times"].append(wait)
+ 
+ 
+def run_parte2():
+    """
+    Parte 2 — ReadWriteLock con prioridad a escritores
+    • 10 lectores (estudiantes) — leen 5 veces cada uno
+    • 2 escritores (profesores) — actualizan 3 veces cada uno
+    """
+    N_READERS = 10
+    N_WRITERS = 2
+    READS_PER_READER = 5
+    WRITES_PER_WRITER = 3
+ 
+    print("\n" + "═" * 60)
+    print("  PARTE 2 — READ-WRITE LOCK (prioridad escritores)")
+    print("═" * 60)
+ 
+    repo = GradeRepositoryRW()
+    threads = []
+    writers_completed = []
+    lock_writers_completed = threading.Lock()
+ 
+    def reader_task(reader_id: int):
+        student_id = f"STU{reader_id:03d}"
+        for i in range(READS_PER_READER):
+            assignment_id = f"ASG{random.randint(1,5):02d}"
+            t_start = time.perf_counter()
+            print(f"  [Lector-{reader_id:02d}] INICIO lectura #{i+1} "
+                  f"({student_id}:{assignment_id})")
+            grade = repo.read_grade(student_id, assignment_id)
+            elapsed = time.perf_counter() - t_start
+            print(f"  [Lector-{reader_id:02d}] FIN   lectura #{i+1} "
+                  f"→ nota={grade} ({elapsed*1000:.1f}ms)")
+            time.sleep(random.uniform(0.0, 0.2))
+ 
+    def writer_task(writer_id: int):
+        for i in range(WRITES_PER_WRITER):
+            student_num = random.randint(1, 15)
+            student_id = f"STU{student_num:03d}"
+            assignment_id = f"ASG{random.randint(1,5):02d}"
+            new_score = round(random.uniform(0, 100), 1)
+            t_start = time.perf_counter()
+            print(f"  [Escritor-{writer_id}] ✏ ESCRIBIENDO nota {new_score} "
+                  f"→ {student_id}:{assignment_id}")
+            repo.update_grade(student_id, assignment_id, new_score)
+            elapsed = time.perf_counter() - t_start
+            print(f"  [Escritor-{writer_id}] ✏ ESCRITO en {elapsed*1000:.1f}ms")
+            time.sleep(random.uniform(0.1, 0.5))
+        with lock_writers_completed:
+            writers_completed.append(writer_id)
+ 
+    start = time.time()
+ 
+    #lectores
+    for i in range(1, N_READERS + 1):
+        t = threading.Thread(target=reader_task, args=(i,), name=f"Reader-{i}")
+        threads.append(t)
+ 
+    #escritores
+    for i in range(1, N_WRITERS + 1):
+        t = threading.Thread(target=writer_task, args=(i,), name=f"Writer-{i}")
+        threads.append(t)
+ 
+    #arrancar todos
+    for t in threads:
+        t.start()
+        time.sleep(random.uniform(0.0, 0.1))
+ 
+    for t in threads:
+        t.join()
+ 
+    elapsed = time.time() - start
+    s = repo.stats
+ 
+    print(f"\n  ── Estadísticas Parte 2 ────────────────────────")
+    print(f"  Tiempo total de ejecución:   {elapsed:.2f}s")
+    print(f"  Total lecturas realizadas:   {s['reads']}")
+    print(f"  Total escrituras realizadas: {s['writes']}")
+    if s["read_wait_times"]:
+        print(f"  Tiempo espera lectores (prom): "
+              f"{statistics.mean(s['read_wait_times'])*1000:.2f}ms")
+    if s["write_wait_times"]:
+        print(f"  Tiempo espera escritores (prom): "
+              f"{statistics.mean(s['write_wait_times'])*1000:.2f}ms")
+    print(f"  Escritores sin inanición:    "
+          f"{len(writers_completed)}/{N_WRITERS} ✓")
+ 
+ 
+#Barrier: inicio sincronizado de examen
+def run_parte3():
+    """Parte 3 — threading.Barrier para inicio simultáneo de examen"""
+    N_STUDENTS = 5
+ 
+    print("\n" + "═" * 60)
+    print("  PARTE 3 — BARRIER: INICIO SINCRONIZADO DE EXAMEN")
+    print("═" * 60)
+ 
+    # threading.Barrier(n): libera cuando n hilos han llamado barrier.wait()
+    barrier = threading.Barrier(N_STUDENTS)
+    exam_results = {}
+    results_lock = threading.Lock()
+ 
+    def student_exam(student_id: int):
+        #llegada escalonada aleatoria
+        arrival_delay = random.uniform(0.5, 3.0)
+        time.sleep(arrival_delay)
+ 
+        print(f"  Estudiante {student_id} está listo "
+              f"(llegó en {arrival_delay:.2f}s) — esperando a los demás...")
+ 
+        try:
+            #todos esperan aquí hasta que los N estén presentes
+            barrier.wait(timeout=10)
+        except threading.BrokenBarrierError:
+            print(f"  [ERROR] Barrera rota para Estudiante {student_id}")
+            return
+ 
+        #este print ocurre (casi) simultáneamente en todos los hilos
+        print(f"  ▶ Estudiante {student_id} COMIENZA EL EXAMEN")
+ 
+        #simula resolución del examen
+        exam_time = random.uniform(1.0, 3.0)
+        time.sleep(exam_time)
+        score = round(random.uniform(40, 100), 1)
+ 
+        with results_lock:
+            exam_results[student_id] = {"score": score, "time": exam_time}
+ 
+        print(f"  ✓ Estudiante {student_id} TERMINÓ el examen "
+              f"| nota={score} | duración={exam_time:.2f}s")
+ 
+    start = time.time()
+    exam_threads = [
+        threading.Thread(target=student_exam, args=(i,), name=f"Student-{i}")
+        for i in range(1, N_STUDENTS + 1)
+    ]
+ 
+    for t in exam_threads:
+        t.start()
+ 
+    for t in exam_threads:
+        t.join()
+ 
+    elapsed = time.time() - start
+ 
+    print(f"\n  ── Resumen Parte 3 ────────────────────────────")
+    print(f"  Tiempo total (llegadas + examen): {elapsed:.2f}s")
+    scores = [v["score"] for v in exam_results.values()]
+    print(f"  Promedio notas:  {statistics.mean(scores):.1f}")
+    print(f"  Nota más alta:   {max(scores):.1f}")
+    print(f"  Nota más baja:   {min(scores):.1f}")
+    for sid, res in sorted(exam_results.items()):
+        print(f"    Estudiante {sid}: {res['score']:.1f} puntos ({res['time']:.2f}s)")
+ 
+ 
+#main
+if __name__ == "__main__":
+    print("\n" + "█" * 60)
+    print("  HISTORIA #8 — PLATAFORMA LMS CONCURRENTE")
+    print("█" * 60)
+ 
+    total_start = time.time()
+ 
+    run_parte1()
+    run_parte2()
+    run_parte3()
+ 
+    total_elapsed = time.time() - total_start
+    print("\n" + "█" * 60)
+    print(f"  EJECUCIÓN COMPLETA en {total_elapsed:.2f}s")
+    print("█" * 60 + "\n")
+ 
